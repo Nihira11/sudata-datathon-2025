@@ -21,11 +21,10 @@ library(knitr)
 library(kableExtra)
 
 set.seed(123)
-dir.create("figures", showWarnings = FALSE)
 ```
 
 ```{r}
-df <- read_csv("~/Desktop/sudata-datathon-2025/data/dynamic_supply_chain_logistics_dataset.csv") %>%
+df <- read_csv("~/Desktop/sudata-datathon-2025/data/raw/dynamic_supply_chain_logistics_dataset.csv") %>%
   clean_names()
 
 glimpse(df)
@@ -69,6 +68,11 @@ train_reg <- reg[idx_reg,]; test_reg <- reg[-idx_reg,]
 dly <- df %>% drop_na(delay_probability)
 idx_dly <- createDataPartition(dly$delay_probability, p = 0.8, list = FALSE)
 train_dly <- dly[idx_dly,]; test_dly <- dly[-idx_dly,]
+
+# Disruption Likelihood
+disr <- df %>% drop_na(disruption_likelihood_score)
+idx_disr <- createDataPartition(disr$disruption_likelihood_score, p = 0.8, list = FALSE)
+train_disr <- disr[idx_disr,]; test_disr <- disr[-idx_disr,]
 ```
 
 ```{r}
@@ -97,13 +101,15 @@ model_rf <- train(
   importance = TRUE
 )
 pred_rf <- predict(model_rf, test_cls)
+pred_rf <- factor(pred_rf, levels = levels(test_cls$risk_classification))
 confusionMatrix(pred_rf, test_cls$risk_classification)
 ```
 
 ```{r}
 vip(model_rf$finalModel, num_features = 15) +
-  ggtitle("RF: Risk Classification — Feature Importance") +
+  ggtitle("RF: Risk Classification\nFeature Importance") +
   theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
   geom_bar(stat = "identity", aes(fill = Importance)) +
   scale_fill_gradient(low = "lightblue", high = "darkblue") +
   theme(legend.position = "none")
@@ -129,13 +135,15 @@ model_xgb <- train(
   tuneGrid = grid
 )
 pred_xgb <- predict(model_xgb, test_cls)
+pred_xgb <- factor(pred_xgb, levels = levels(test_cls$risk_classification))
 confusionMatrix(pred_xgb, test_cls$risk_classification)
 ```
 
 ```{r}
 vip(model_xgb$finalModel, num_features = 15) +
-  ggtitle("XGB: Risk Classification — Feature Importance") +
+  ggtitle("XGB: Risk Classification\nFeature Importance") +
   theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
   geom_bar(stat = "identity", aes(fill = Importance)) +
   scale_fill_gradient(low = "lightgreen", high = "darkgreen") +
   theme(legend.position = "none")
@@ -159,8 +167,9 @@ met_lm  <- postResample(pred_lm, test_reg$delivery_time_deviation)
 
 ```{r}
 vip(model_lm$finalModel, num_features = 15) +
-  ggtitle("Linear Regression: Delivery Deviation — Feature Importance") +
+  ggtitle("Linear Regression: Delivery Deviation\nFeature Importance") +
   theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
   geom_bar(stat = "identity", aes(fill = Importance)) +
   scale_fill_gradientn(colors = c("yellow", "orange", "red", "purple", "blue")) +
   theme(legend.position = "none")
@@ -193,8 +202,9 @@ print(met_xgb_reg)
 
 ```{r}
 vip(model_lm$finalModel, num_features = 15) +
-  ggtitle("Linear Regression: Delivery Deviation — Feature Importance") +
+  ggtitle("Linear Regression: Delivery Deviation\nFeature Importance") +
   theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
   geom_bar(stat = "identity", aes(fill = Importance)) +
   scale_fill_gradientn(colors = c("pink", "violet", "purple", "darkblue")) +
   theme(legend.position = "none")
@@ -205,10 +215,12 @@ vip(model_lm$finalModel, num_features = 15) +
 
 # Data Prep
 train_dly_cls <- train_dly %>%
-  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no")))
+  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"),
+                          levels = c("no", "yes")))
 
 test_dly_cls <- test_dly %>%
-  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no")))
+  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"),
+                          levels = c("no", "yes")))
 
 feat_cols <- setdiff(names(train_dly_cls), c("delayed", "delay_probability", drop_cols))
 
@@ -240,8 +252,9 @@ confusionMatrix(pred_logit, test_dly_cls$delayed, positive = "yes")
 
 ```{r}
 vip(model_logit$finalModel, num_features = 15) +
-  ggtitle("Logistic Regression: Delay Probability — Feature Importance") +
+  ggtitle("Logistic Regression: Delay Probability\nFeature Importance") +
   theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
   geom_bar(stat = "identity", aes(fill = Importance)) +
   scale_fill_gradient(low = "orange", high = "red") +
   theme(legend.position = "none")
@@ -258,7 +271,7 @@ ctrl <- trainControl(
 )
 
 model_rf <- train(
-  x = train_dly_cls[, feat_cols],
+  x = train_dly_cls[, feat_cols] %>% as.data.frame(),
   y = train_dly_cls$delayed,
   method = "rf",
   trControl = ctrl,
@@ -267,14 +280,16 @@ model_rf <- train(
   ntree = 100 
 )
 
-pred_rf <- predict(model_rf, test_dly_cls[, feat_cols])
+pred_rf <- predict(model_rf, newdata = test_dly_cls[, feat_cols] %>% as.data.frame())
+pred_rf <- factor(pred_rf, levels = levels(test_dly_cls$delayed))
 confusionMatrix(pred_rf, test_dly_cls$delayed, positive = "yes")
 ```
 
 ```{r}
 vip(model_rf$finalModel, num_features = 15) +
-  ggtitle("RF: Delay Classification — Feature Importance") +
+  ggtitle("RF: Delay Classification\nFeature Importance") +
   theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
   geom_bar(stat = "identity", aes(fill = Importance)) +
   scale_fill_gradient(low = "orange", high = "red") +
   theme(legend.position = "none")
@@ -341,8 +356,70 @@ confusionMatrix(pred_xgb, test_xgb$delayed, positive = "yes")
 vip(model_xgb$finalModel, num_features = 15) +
   ggtitle("XGB: Delay Probability — Feature Importance") +
   theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
   geom_bar(stat = "identity", aes(fill = Importance)) +
   scale_fill_gradientn(colors = c("orange", "magenta", "red")) +
   theme(legend.position = "none")
 ```
 
+```{r}
+# Disruption Likelihood Score
+
+# Linear Regression
+model_lm_disr <- train(
+  disruption_likelihood_score ~ .,
+  data = train_disr %>% select(-all_of(drop_cols)),
+  method = "lm",
+  trControl = trainControl(method = "cv", number = 5),
+  preProcess = c("center", "scale")
+)
+
+pred_lm_disr <- predict(model_lm_disr, newdata = test_disr %>% select(-all_of(drop_cols)))
+met_lm_disr  <- postResample(pred_lm_disr, test_disr$disruption_likelihood_score)
+print(met_lm_disr)
+```
+
+```{r}
+vip(model_lm_disr$finalModel, num_features = 15) +
+  ggtitle("Linear Regression: Disruption Likelihood\nFeature Importance") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
+  geom_bar(stat = "identity", aes(fill = Importance)) +
+  scale_fill_gradient(low = "lightgreen", high = "darkgreen") +
+  theme(legend.position = "none")
+```
+
+```{r}
+# XGBoost
+grid_disr <- expand.grid(
+  nrounds = 100,
+  max_depth = c(3, 5),
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+model_xgb_disr <- train(
+  disruption_likelihood_score ~ .,
+  data = train_disr %>% select(-all_of(drop_cols)),
+  method = "xgbTree",
+  trControl = trainControl(method = "cv", number = 3),
+  tuneGrid = grid_disr
+)
+
+pred_xgb_disr <- predict(model_xgb_disr, newdata = test_disr %>% select(-all_of(drop_cols)))
+met_xgb_disr  <- postResample(pred_xgb_disr, test_disr$disruption_likelihood_score)
+print(met_xgb_disr)
+```
+
+```{r}
+vip(model_xgb_disr$finalModel, num_features = 15) +
+  ggtitle("XGB: Disruption Likelihood\nFeature Importance") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
+  geom_bar(stat = "identity", aes(fill = Importance)) +
+  scale_fill_gradientn(colors = c("gold", "orange", "brown")) +
+  theme(legend.position = "none")
+```
