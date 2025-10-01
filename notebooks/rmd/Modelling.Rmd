@@ -405,6 +405,47 @@ vip(model_xgb_disr$finalModel, num_features = 15) +
 ## Model Selection
 
 ```{r}
+# Build formula for full model (exclude leakage cols and other targets)
+form_cls <- as.formula(
+  paste("risk_classification ~",
+        paste(setdiff(names(train_cls_noleak), "risk_classification"),
+              collapse = "+"))
+)
 
+# Full multinomial model
+full_model_cls <- multinom(form_cls, data = train_cls_noleak, trace = FALSE)
+
+# Null model (intercept only)
+null_model_cls <- multinom(risk_classification ~ 1, data = train_cls_noleak, trace = FALSE)
+
+# ---- Stepwise with AIC (both directions) ----
+step_aic_cls <- stepAIC(
+  null_model_cls,
+  scope = list(lower = null_model_cls, upper = full_model_cls),
+  direction = "both",
+  trace = TRUE
+)
+summary(step_aic_cls)
+
+# ---- Stepwise with BIC (both directions) ----
+n_cls <- nrow(train_cls_noleak)
+step_bic_cls <- stepAIC(
+  null_model_cls,
+  scope = list(lower = null_model_cls, upper = full_model_cls),
+  direction = "both",
+  k = log(n_cls),   # BIC penalty
+  trace = TRUE
+)
+summary(step_bic_cls)
+```
+
+```{r}
+pred_aic <- predict(step_aic_cls, newdata = test_cls_noleak)
+confusionMatrix(pred_aic, test_cls$risk_classification)
+```
+
+```{r}
+pred_bic <- predict(step_bic_cls, newdata = test_cls_noleak)
+confusionMatrix(pred_bic, test_cls$risk_classification)
 ```
 
