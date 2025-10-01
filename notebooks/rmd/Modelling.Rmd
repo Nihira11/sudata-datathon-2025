@@ -19,12 +19,14 @@ library(dplyr)
 library(tibble)
 library(knitr)
 library(kableExtra)
+library(MASS)
+library(car)
 
 set.seed(123)
 ```
 
 ```{r}
-df <- read_csv("~/Desktop/sudata-datathon-2025/data/raw/dynamic_supply_chain_logistics_dataset.csv") %>%
+df <- read_csv("~/Desktop/sudata-datathon-2025/datasets/dynamic_supply_chain_logistics_dataset.csv") %>%
   clean_names()
 
 glimpse(df)
@@ -50,6 +52,18 @@ df$delay_probability[df$delay_probability > 1] <- 1
 ```{r}
 drop_cols <- c("timestamp","vehicle_gps_latitude","vehicle_gps_longitude")
 
+targets <- c(
+  "disruption_likelihood_score",
+  "delay_probability",
+  "risk_classification",
+  "delivery_time_deviation"
+)
+
+drop_leakage <- function(data, target) {
+  other_targets <- setdiff(targets, target)
+  data %>% dplyr::select(-all_of(c(drop_cols, other_targets)))
+}
+
 features <- setdiff(names(df), drop_cols)
 ```
 
@@ -65,7 +79,9 @@ idx_reg <- createDataPartition(reg$delivery_time_deviation, p = 0.8, list = FALS
 train_reg <- reg[idx_reg,]; test_reg <- reg[-idx_reg,]
 
 # Delay Probability
-dly <- df %>% drop_na(delay_probability)
+dly <- df %>% drop_na(delay_probability) %>%
+  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"), 
+                          levels = c("no","yes")))
 idx_dly <- createDataPartition(dly$delay_probability, p = 0.8, list = FALSE)
 train_dly <- dly[idx_dly,]; test_dly <- dly[-idx_dly,]
 
@@ -77,42 +93,20 @@ train_disr <- disr[idx_disr,]; test_disr <- disr[-idx_disr,]
 
 ```{r}
 # Risk Classification
+train_cls_noleak <- drop_leakage(train_cls, "risk_classification")
+test_cls_noleak  <- drop_leakage(test_cls,  "risk_classification")
 
 # Multinomial Logistic
 model_multinom <- train(
   risk_classification ~ .,
-  data = train_cls %>% select(-all_of(drop_cols)),
+  data = train_cls_noleak,
   method = "multinom",
-  trControl = trainControl(method = "cv", number = 5),
+  trControl = trainControl(method = "cv", number = 5, sampling = "smote"),
   preProcess = c("center","scale"),
   trace = FALSE
 )
-pred_multinom <- predict(model_multinom, test_cls)
+pred_multinom <- predict(model_multinom, test_cls_noleak)
 confusionMatrix(pred_multinom, test_cls$risk_classification)
-```
-
-```{r}
-# Random Forest
-model_rf <- train(
-  risk_classification ~ .,
-  data = train_cls %>% select(-all_of(drop_cols)),
-  method = "rf",
-  trControl = trainControl(method = "cv", number = 3),
-  importance = TRUE
-)
-pred_rf <- predict(model_rf, test_cls)
-pred_rf <- factor(pred_rf, levels = levels(test_cls$risk_classification))
-confusionMatrix(pred_rf, test_cls$risk_classification)
-```
-
-```{r}
-vip(model_rf$finalModel, num_features = 15) +
-  ggtitle("RF: Risk Classification\nFeature Importance") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
-  geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradient(low = "lightblue", high = "darkblue") +
-  theme(legend.position = "none")
 ```
 
 ```{r}
@@ -127,14 +121,20 @@ grid <- expand.grid(
   subsample = 0.8
 )
 
+ctrl <- trainControl(
+  method = "cv",
+  number = 3,
+  sampling = "smote"
+)
+
 model_xgb <- train(
   risk_classification ~ .,
-  data = train_cls %>% select(-all_of(drop_cols)),
+  data = train_cls_noleak,
   method = "xgbTree",
-  trControl = trainControl(method = "cv", number = 3),
+  trControl = ctrl,
   tuneGrid = grid
 )
-pred_xgb <- predict(model_xgb, test_cls)
+pred_xgb <- predict(model_xgb, newdata = test_cls_noleak)
 pred_xgb <- factor(pred_xgb, levels = levels(test_cls$risk_classification))
 confusionMatrix(pred_xgb, test_cls$risk_classification)
 ```
@@ -151,17 +151,18 @@ vip(model_xgb$finalModel, num_features = 15) +
 
 ```{r}
 # Delivery Time Deviation
-drop_cols <- c("timestamp","vehicle_gps_latitude","vehicle_gps_longitude")
+train_reg_noleak <- drop_leakage(train_reg, "delivery_time_deviation")
+test_reg_noleak  <- drop_leakage(test_reg,  "delivery_time_deviation")
 
 # Linear Regression
 model_lm <- train(
   delivery_time_deviation ~ .,
-  data = train_reg %>% select(-all_of(drop_cols)),
+  data = train_reg_noleak,
   method = "lm",
   trControl = trainControl(method = "cv", number = 5),
   preProcess = c("center","scale")
 )
-pred_lm <- predict(model_lm, newdata = test_reg %>% select(-all_of(drop_cols)))
+pred_lm <- predict(model_lm, newdata = test_reg_noleak)
 met_lm  <- postResample(pred_lm, test_reg$delivery_time_deviation)
 ```
 
@@ -190,12 +191,12 @@ grid <- expand.grid(
 
 model_xgb_reg <- train(
   delivery_time_deviation ~ .,
-  data = train_reg %>% select(-all_of(drop_cols)),
+  data = train_reg_noleak,
   method = "xgbTree",
   trControl = trainControl(method = "cv", number = 3),
   tuneGrid = grid
 )
-pred_xgb_reg <- predict(model_xgb_reg, newdata = test_reg %>% select(-all_of(drop_cols)))
+pred_xgb_reg <- predict(model_xgb_reg, newdata = test_reg_noleak)
 met_xgb_reg  <- postResample(pred_xgb_reg, test_reg$delivery_time_deviation)
 print(met_xgb_reg)
 ```
@@ -214,15 +215,15 @@ vip(model_lm$finalModel, num_features = 15) +
 # Delay Probability
 
 # Data Prep
-train_dly_cls <- train_dly %>%
-  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"),
-                          levels = c("no", "yes")))
+train_dly_noleak <- drop_leakage(train_dly, "delay_probability")
+test_dly_noleak  <- drop_leakage(test_dly,  "delay_probability")
 
-test_dly_cls <- test_dly %>%
-  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"),
-                          levels = c("no", "yes")))
+train_dly_cls <- train_dly_noleak %>%
+  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes","no"), levels=c("no","yes")))
+test_dly_cls  <- test_dly_noleak %>%
+  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes","no"), levels=c("no","yes")))
 
-feat_cols <- setdiff(names(train_dly_cls), c("delayed", "delay_probability", drop_cols))
+feat_cols <- setdiff(names(train_dly_cls), c("delayed","delay_probability")) 
 
 table(train_dly_cls$delayed)
 prop.table(table(train_dly_cls$delayed))
@@ -235,7 +236,7 @@ ctrl <- trainControl(
   number = 5,
   classProbs = TRUE,
   summaryFunction = twoClassSummary,
-  sampling = "down"
+  sampling = "smote"
 )
 model_logit <- train(
   x = train_dly_cls[, feat_cols] %>% as.data.frame(),
@@ -261,63 +262,37 @@ vip(model_logit$finalModel, num_features = 15) +
 ```
 
 ```{r}
-# Random Forest
-ctrl <- trainControl(
-  method = "cv", 
-  number = 3,
-  classProbs = TRUE,
-  summaryFunction = twoClassSummary,
-  sampling = "down"
-)
-
-model_rf <- train(
-  x = train_dly_cls[, feat_cols] %>% as.data.frame(),
-  y = train_dly_cls$delayed,
-  method = "rf",
-  trControl = ctrl,
-  metric = "ROC",
-  importance = TRUE,
-  ntree = 100 
-)
-
-pred_rf <- predict(model_rf, newdata = test_dly_cls[, feat_cols] %>% as.data.frame())
-pred_rf <- factor(pred_rf, levels = levels(test_dly_cls$delayed))
-confusionMatrix(pred_rf, test_dly_cls$delayed, positive = "yes")
-```
-
-```{r}
-vip(model_rf$finalModel, num_features = 15) +
-  ggtitle("RF: Delay Classification\nFeature Importance") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
-  geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradient(low = "orange", high = "red") +
-  theme(legend.position = "none")
-```
-
-```{r}
 # Data Prep 2
-train_dly_cls$delayed <- factor(train_dly_cls$delayed, levels = c("no","yes"))
-test_dly_cls$delayed  <- factor(test_dly_cls$delayed,  levels = c("no","yes"))
+train_dly_cls <- train_dly %>%
+  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"),
+                          levels = c("no","yes")))
+test_dly_cls <- test_dly %>%
+  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"),
+                          levels = c("no","yes")))
 
-train_xgb <- train_dly_cls %>%
-  select(delayed, all_of(feat_cols)) %>%
-  mutate(across(where(is.character), factor),
-         across(where(is.logical), as.integer)) %>%
-  as.data.frame()
+targets <- c("disruption_likelihood_score",
+             "delay_probability",
+             "risk_classification",
+             "delivery_time_deviation")
 
-test_xgb <- test_dly_cls %>%
-  select(delayed, all_of(feat_cols)) %>%
-  mutate(across(where(is.character), factor),
-         across(where(is.logical), as.integer)) %>%
-  as.data.frame()
+feat_cols <- setdiff(colnames(train_dly_cls),
+                     c("delayed", targets, drop_cols))
 
-nzv <- nearZeroVar(train_xgb)
-if (length(nzv)) {
-  keep <- setdiff(names(train_xgb), names(train_xgb)[nzv])
-  train_xgb <- train_xgb[, keep, drop = FALSE]
-  test_xgb  <- test_xgb[,  keep, drop = FALSE]
-}
+train_mat <- train_dly_cls[, feat_cols, drop = FALSE] %>%
+  dplyr::mutate(dplyr::across(where(is.logical), as.integer))
+test_mat  <- test_dly_cls[, feat_cols, drop = FALSE] %>%
+  dplyr::mutate(dplyr::across(where(is.logical), as.integer))
+
+dmy <- caret::dummyVars(~ ., data = train_mat, fullRank = TRUE)
+X_train <- as.data.frame(predict(dmy, newdata = train_mat))
+X_test  <- as.data.frame(predict(dmy, newdata = test_mat))
+
+nzv <- caret::nearZeroVar(X_train)
+if (length(nzv)) X_train <- X_train[, -nzv, drop = FALSE]
+X_test <- X_test[, colnames(X_train), drop = FALSE]
+
+train_xgb <- cbind(delayed = train_dly_cls$delayed, X_train)
+test_xgb  <- cbind(delayed = test_dly_cls$delayed,  X_test)
 ```
 
 ```{r}
@@ -364,17 +339,19 @@ vip(model_xgb$finalModel, num_features = 15) +
 
 ```{r}
 # Disruption Likelihood Score
+train_disr_noleak <- drop_leakage(train_disr, "disruption_likelihood_score")
+test_disr_noleak  <- drop_leakage(test_disr,  "disruption_likelihood_score")
 
 # Linear Regression
 model_lm_disr <- train(
   disruption_likelihood_score ~ .,
-  data = train_disr %>% select(-all_of(drop_cols)),
+  data = train_disr_noleak,
   method = "lm",
   trControl = trainControl(method = "cv", number = 5),
   preProcess = c("center", "scale")
 )
 
-pred_lm_disr <- predict(model_lm_disr, newdata = test_disr %>% select(-all_of(drop_cols)))
+pred_lm_disr <- predict(model_lm_disr, newdata = test_disr_noleak)
 met_lm_disr  <- postResample(pred_lm_disr, test_disr$disruption_likelihood_score)
 print(met_lm_disr)
 ```
@@ -403,13 +380,13 @@ grid_disr <- expand.grid(
 
 model_xgb_disr <- train(
   disruption_likelihood_score ~ .,
-  data = train_disr %>% select(-all_of(drop_cols)),
+  data = train_disr_noleak,
   method = "xgbTree",
   trControl = trainControl(method = "cv", number = 3),
   tuneGrid = grid_disr
 )
 
-pred_xgb_disr <- predict(model_xgb_disr, newdata = test_disr %>% select(-all_of(drop_cols)))
+pred_xgb_disr <- predict(model_xgb_disr, newdata = test_disr_noleak)
 met_xgb_disr  <- postResample(pred_xgb_disr, test_disr$disruption_likelihood_score)
 print(met_xgb_disr)
 ```
@@ -423,3 +400,11 @@ vip(model_xgb_disr$finalModel, num_features = 15) +
   scale_fill_gradientn(colors = c("gold", "orange", "brown")) +
   theme(legend.position = "none")
 ```
+
+
+## Model Selection
+
+```{r}
+
+```
+
