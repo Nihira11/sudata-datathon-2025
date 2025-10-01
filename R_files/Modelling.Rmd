@@ -15,6 +15,10 @@ library(xgboost)
 library(nnet)
 library(vip)
 library(pROC)
+library(dplyr)
+library(tibble)
+library(knitr)
+library(kableExtra)
 
 set.seed(123)
 dir.create("figures", showWarnings = FALSE)
@@ -157,9 +161,10 @@ met_lm  <- postResample(pred_lm, test_reg$delivery_time_deviation)
 vip(model_lm$finalModel, num_features = 15) +
   ggtitle("Linear Regression: Delivery Deviation — Feature Importance") +
   theme_minimal(base_size = 14) +
-  geom_bar(stat = "identity", aes(fill = Variable)) +
-  scale_fill_brewer(palette = "Set3") +
+  geom_bar(stat = "identity", aes(fill = Importance)) +
+  scale_fill_gradientn(colors = c("yellow", "orange", "red", "purple", "blue")) +
   theme(legend.position = "none")
+
 ```
 
 ```{r}
@@ -187,11 +192,11 @@ print(met_xgb_reg)
 ```
 
 ```{r}
-vip(model_xgb_reg$finalModel, num_features = 15) +
-  ggtitle("XGB: Delivery Time Deviation — Feature Importance") +
+vip(model_lm$finalModel, num_features = 15) +
+  ggtitle("Linear Regression: Delivery Deviation — Feature Importance") +
   theme_minimal(base_size = 14) +
-  geom_bar(stat = "identity", aes(fill = Variable)) +
-  scale_fill_brewer(palette = "Dark2") +
+  geom_bar(stat = "identity", aes(fill = Importance)) +
+  scale_fill_gradientn(colors = c("pink", "violet", "purple", "darkblue")) +
   theme(legend.position = "none")
 ```
 
@@ -271,7 +276,7 @@ vip(model_rf$finalModel, num_features = 15) +
   ggtitle("RF: Delay Classification — Feature Importance") +
   theme_minimal(base_size = 14) +
   geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradient(low = "orange", high = "red") +  # gradient for delay task
+  scale_fill_gradient(low = "orange", high = "red") +
   theme(legend.position = "none")
 ```
 
@@ -337,6 +342,7 @@ vip(model_xgb$finalModel, num_features = 15) +
   ggtitle("XGB: Delay Probability — Feature Importance") +
   theme_minimal(base_size = 14) +
   geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradient(low = "pink", high = "purple") +
+  scale_fill_gradientn(colors = c("orange", "magenta", "red")) +
   theme(legend.position = "none")
 ```
+
