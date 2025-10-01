@@ -5,26 +5,338 @@ date: "2025-10-01"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+```{r}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(nnet)
+library(vip)
+library(pROC)
+
+set.seed(123)
+dir.create("figures", showWarnings = FALSE)
 ```
 
-## R Markdown
+```{r}
+df <- read_csv("~/Desktop/sudata-datathon-2025/data/dynamic_supply_chain_logistics_dataset.csv") %>%
+  clean_names()
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+glimpse(df)
 ```
 
-## Including Plots
+```{r}
+# Risk Classification
+df$risk_classification <- df$risk_classification %>%
+  tolower() %>%
+  trimws() %>%
+  factor(levels = c("low risk", "moderate risk", "high risk"),
+         labels = c("low_risk", "moderate_risk", "high_risk"))
 
-You can also embed plots, for example:
+# Delivery time deviation
+df$delivery_time_deviation <- as.numeric(df$delivery_time_deviation)
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+# Delay probability
+df$delay_probability <- as.numeric(df$delay_probability)
+df$delay_probability[df$delay_probability < 0] <- 0
+df$delay_probability[df$delay_probability > 1] <- 1
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+drop_cols <- c("timestamp","vehicle_gps_latitude","vehicle_gps_longitude")
+
+features <- setdiff(names(df), drop_cols)
+```
+
+```{r}
+# Risk Classification
+cls <- df %>% drop_na(risk_classification)
+idx_cls <- createDataPartition(cls$risk_classification, p = 0.8, list = FALSE)
+train_cls <- cls[idx_cls,]; test_cls <- cls[-idx_cls,]
+
+# Delivery Deviation
+reg <- df %>% drop_na(delivery_time_deviation)
+idx_reg <- createDataPartition(reg$delivery_time_deviation, p = 0.8, list = FALSE)
+train_reg <- reg[idx_reg,]; test_reg <- reg[-idx_reg,]
+
+# Delay Probability
+dly <- df %>% drop_na(delay_probability)
+idx_dly <- createDataPartition(dly$delay_probability, p = 0.8, list = FALSE)
+train_dly <- dly[idx_dly,]; test_dly <- dly[-idx_dly,]
+```
+
+```{r}
+# Risk Classification
+
+# Multinomial Logistic
+model_multinom <- train(
+  risk_classification ~ .,
+  data = train_cls %>% select(-all_of(drop_cols)),
+  method = "multinom",
+  trControl = trainControl(method = "cv", number = 5),
+  preProcess = c("center","scale"),
+  trace = FALSE
+)
+pred_multinom <- predict(model_multinom, test_cls)
+confusionMatrix(pred_multinom, test_cls$risk_classification)
+```
+
+```{r}
+# Random Forest
+model_rf <- train(
+  risk_classification ~ .,
+  data = train_cls %>% select(-all_of(drop_cols)),
+  method = "rf",
+  trControl = trainControl(method = "cv", number = 3),
+  importance = TRUE
+)
+pred_rf <- predict(model_rf, test_cls)
+confusionMatrix(pred_rf, test_cls$risk_classification)
+```
+
+```{r}
+vip(model_rf$finalModel, num_features = 15) +
+  ggtitle("RF: Risk Classification — Feature Importance") +
+  theme_minimal(base_size = 14) +
+  geom_bar(stat = "identity", aes(fill = Importance)) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  theme(legend.position = "none")
+```
+
+```{r}
+# XGBoost
+grid <- expand.grid(
+  nrounds = 100,
+  max_depth = c(3, 5),
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+model_xgb <- train(
+  risk_classification ~ .,
+  data = train_cls %>% select(-all_of(drop_cols)),
+  method = "xgbTree",
+  trControl = trainControl(method = "cv", number = 3),
+  tuneGrid = grid
+)
+pred_xgb <- predict(model_xgb, test_cls)
+confusionMatrix(pred_xgb, test_cls$risk_classification)
+```
+
+```{r}
+vip(model_xgb$finalModel, num_features = 15) +
+  ggtitle("XGB: Risk Classification — Feature Importance") +
+  theme_minimal(base_size = 14) +
+  geom_bar(stat = "identity", aes(fill = Importance)) +
+  scale_fill_gradient(low = "lightgreen", high = "darkgreen") +
+  theme(legend.position = "none")
+```
+
+```{r}
+# Delivery Time Deviation
+drop_cols <- c("timestamp","vehicle_gps_latitude","vehicle_gps_longitude")
+
+# Linear Regression
+model_lm <- train(
+  delivery_time_deviation ~ .,
+  data = train_reg %>% select(-all_of(drop_cols)),
+  method = "lm",
+  trControl = trainControl(method = "cv", number = 5),
+  preProcess = c("center","scale")
+)
+pred_lm <- predict(model_lm, newdata = test_reg %>% select(-all_of(drop_cols)))
+met_lm  <- postResample(pred_lm, test_reg$delivery_time_deviation)
+```
+
+```{r}
+vip(model_lm$finalModel, num_features = 15) +
+  ggtitle("Linear Regression: Delivery Deviation — Feature Importance") +
+  theme_minimal(base_size = 14) +
+  geom_bar(stat = "identity", aes(fill = Variable)) +
+  scale_fill_brewer(palette = "Set3") +
+  theme(legend.position = "none")
+```
+
+```{r}
+# XGBoost Regression
+grid <- expand.grid(
+  nrounds = 100,
+  max_depth = c(3, 5),
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+model_xgb_reg <- train(
+  delivery_time_deviation ~ .,
+  data = train_reg %>% select(-all_of(drop_cols)),
+  method = "xgbTree",
+  trControl = trainControl(method = "cv", number = 3),
+  tuneGrid = grid
+)
+pred_xgb_reg <- predict(model_xgb_reg, newdata = test_reg %>% select(-all_of(drop_cols)))
+met_xgb_reg  <- postResample(pred_xgb_reg, test_reg$delivery_time_deviation)
+print(met_xgb_reg)
+```
+
+```{r}
+vip(model_xgb_reg$finalModel, num_features = 15) +
+  ggtitle("XGB: Delivery Time Deviation — Feature Importance") +
+  theme_minimal(base_size = 14) +
+  geom_bar(stat = "identity", aes(fill = Variable)) +
+  scale_fill_brewer(palette = "Dark2") +
+  theme(legend.position = "none")
+```
+
+```{r}
+# Delay Probability
+
+# Data Prep
+train_dly_cls <- train_dly %>%
+  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no")))
+
+test_dly_cls <- test_dly %>%
+  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no")))
+
+feat_cols <- setdiff(names(train_dly_cls), c("delayed", "delay_probability", drop_cols))
+
+table(train_dly_cls$delayed)
+prop.table(table(train_dly_cls$delayed))
+```
+
+```{r}
+# Logistic Regression (baseline)
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "down"
+)
+model_logit <- train(
+  x = train_dly_cls[, feat_cols] %>% as.data.frame(),
+  y = train_dly_cls$delayed,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+pred_logit <- predict(model_logit, test_dly_cls[, feat_cols])
+confusionMatrix(pred_logit, test_dly_cls$delayed, positive = "yes")
+```
+
+```{r}
+vip(model_logit$finalModel, num_features = 15) +
+  ggtitle("Logistic Regression: Delay Probability — Feature Importance") +
+  theme_minimal(base_size = 14) +
+  geom_bar(stat = "identity", aes(fill = Importance)) +
+  scale_fill_gradient(low = "orange", high = "red") +
+  theme(legend.position = "none")
+```
+
+```{r}
+# Random Forest
+ctrl <- trainControl(
+  method = "cv", 
+  number = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "down"
+)
+
+model_rf <- train(
+  x = train_dly_cls[, feat_cols],
+  y = train_dly_cls$delayed,
+  method = "rf",
+  trControl = ctrl,
+  metric = "ROC",
+  importance = TRUE,
+  ntree = 100 
+)
+
+pred_rf <- predict(model_rf, test_dly_cls[, feat_cols])
+confusionMatrix(pred_rf, test_dly_cls$delayed, positive = "yes")
+```
+
+```{r}
+vip(model_rf$finalModel, num_features = 15) +
+  ggtitle("RF: Delay Classification — Feature Importance") +
+  theme_minimal(base_size = 14) +
+  geom_bar(stat = "identity", aes(fill = Importance)) +
+  scale_fill_gradient(low = "orange", high = "red") +  # gradient for delay task
+  theme(legend.position = "none")
+```
+
+```{r}
+# Data Prep 2
+train_dly_cls$delayed <- factor(train_dly_cls$delayed, levels = c("no","yes"))
+test_dly_cls$delayed  <- factor(test_dly_cls$delayed,  levels = c("no","yes"))
+
+train_xgb <- train_dly_cls %>%
+  select(delayed, all_of(feat_cols)) %>%
+  mutate(across(where(is.character), factor),
+         across(where(is.logical), as.integer)) %>%
+  as.data.frame()
+
+test_xgb <- test_dly_cls %>%
+  select(delayed, all_of(feat_cols)) %>%
+  mutate(across(where(is.character), factor),
+         across(where(is.logical), as.integer)) %>%
+  as.data.frame()
+
+nzv <- nearZeroVar(train_xgb)
+if (length(nzv)) {
+  keep <- setdiff(names(train_xgb), names(train_xgb)[nzv])
+  train_xgb <- train_xgb[, keep, drop = FALSE]
+  test_xgb  <- test_xgb[,  keep, drop = FALSE]
+}
+```
+
+```{r}
+# XGBoost
+ctrl <- trainControl(
+  method = "cv", number = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "down"
+)
+
+grid <- expand.grid(
+  nrounds = 50,
+  max_depth = c(3, 5),
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+model_xgb <- train(
+  delayed ~ .,
+  data = train_xgb,
+  method = "xgbTree",
+  trControl = ctrl,
+  tuneGrid = grid,
+  metric = "ROC",
+)
+
+pred_xgb <- predict(model_xgb, newdata = test_xgb)
+confusionMatrix(pred_xgb, test_xgb$delayed, positive = "yes")
+```
+
+```{r}
+vip(model_xgb$finalModel, num_features = 15) +
+  ggtitle("XGB: Delay Probability — Feature Importance") +
+  theme_minimal(base_size = 14) +
+  geom_bar(stat = "identity", aes(fill = Importance)) +
+  scale_fill_gradient(low = "pink", high = "purple") +
+  theme(legend.position = "none")
+```
