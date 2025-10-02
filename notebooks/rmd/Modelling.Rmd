@@ -7,20 +7,22 @@ output: html_document
 
 ```{r}
 library(tidyverse)
-library(lubridate)
+library(dplyr)
 library(janitor)
+library(tibble)
 library(caret)
+library(vip)
+library(kableExtra)
 library(randomForest)
 library(xgboost)
 library(nnet)
-library(vip)
-library(pROC)
-library(dplyr)
-library(tibble)
-library(knitr)
-library(kableExtra)
+library(dendextend)
+library(factoextra)
+library(RColorBrewer)
+library(doParallel)
+library(smotefamily)
+library(corrplot)
 library(MASS)
-library(car)
 
 set.seed(123)
 ```
@@ -33,85 +35,129 @@ glimpse(df)
 ```
 
 ```{r}
-# Risk Classification
-df$risk_classification <- df$risk_classification %>%
-  tolower() %>%
-  trimws() %>%
-  factor(levels = c("low risk", "moderate risk", "high risk"),
-         labels = c("low_risk", "moderate_risk", "high_risk"))
+# Data Prep
+target_cols <- c("disruption_likelihood_score",
+                 "delay_probability",
+                 "risk_classification",
+                 "delivery_time_deviation")
 
-# Delivery time deviation
-df$delivery_time_deviation <- as.numeric(df$delivery_time_deviation)
+df_mod <- df |> drop_na(all_of(target_cols))
 
-# Delay probability
-df$delay_probability <- as.numeric(df$delay_probability)
-df$delay_probability[df$delay_probability < 0] <- 0
-df$delay_probability[df$delay_probability > 1] <- 1
+drop_cols <- c(target_cols,
+               "timestamp",
+               "vehicle_gps_latitude",
+               "vehicle_gps_longitude")
+
+predictor_cols <- df_mod %>%
+  dplyr::select(-any_of(drop_cols)) %>%
+  dplyr::select(where(is.numeric)) %>%
+  names()
+
+X <- df_mod |> dplyr::select(all_of(predictor_cols))
 ```
 
 ```{r}
-drop_cols <- c("timestamp","vehicle_gps_latitude","vehicle_gps_longitude")
+X_scaled <- scale(X)
+d <- dist(t(X_scaled), method = "euclidean")
+hc <- hclust(d, method = "ward.D2")
+```
 
-targets <- c(
-  "disruption_likelihood_score",
-  "delay_probability",
-  "risk_classification",
-  "delivery_time_deviation"
+```{r}
+clust_4 <- cutree(hc, k = 4)
+groups <- split(names(clust_4), clust_4)
+groups
+```
+
+```{r}
+groups <- list(
+  Operations = c("fuel_consumption_rate", "loading_unloading_time",
+          "handling_equipment_availability", "port_congestion_level",
+          "supplier_reliability_score", "iot_temperature",
+          "route_risk_level", "customs_clearance_time"),
+
+  Risk = c("eta_variation_hours", "traffic_congestion_level",
+           "weather_condition_severity", "driver_behavior_score",
+           "fatigue_monitoring_score"),
+
+  Supply = c("warehouse_inventory_level", "lead_time_days"),
+
+  Logistics = c("order_fulfillment_status", "shipping_costs",
+                "historical_demand", "cargo_condition_status")
 )
+```
 
-drop_leakage <- function(data, target) {
-  other_targets <- setdiff(targets, target)
-  data %>% dplyr::select(-all_of(c(drop_cols, other_targets)))
+```{r}
+# Train/Test Split
+df_mod <- df |>
+  dplyr::mutate(risk_classification = factor(risk_classification)) |>
+  tidyr::drop_na(dplyr::all_of(target_cols))
+
+drop_cols <- c(target_cols, "timestamp", "vehicle_gps_latitude", "vehicle_gps_longitude")
+X <- df_mod |>
+  dplyr::select(-dplyr::any_of(drop_cols)) |>
+  dplyr::select(where(is.numeric))
+
+idx <- caret::createDataPartition(df_mod$risk_classification, p = 0.8, list = FALSE)
+train <- df_mod[idx, ]
+test <- df_mod[-idx, ]
+Xtr <- X[idx, ]
+Xte  <- X[-idx, ]
+```
+
+```{r}
+fit_group_pca <- function(train_df, test_df, groups, var_exp = 0.90) {
+  train_out <- list(); test_out <- list(); store <- list()
+  for (g in names(groups)) {
+    cols <- groups[[g]]
+    x_tr <- scale(train_df[, cols, drop = FALSE])
+    x_te <- scale(test_df[, cols, drop = FALSE],
+                  center = attr(x_tr, "scaled:center"),
+                  scale  = attr(x_tr, "scaled:scale"))
+    pca <- prcomp(x_tr, center = FALSE, scale. = FALSE)
+    vr  <- pca$sdev^2 / sum(pca$sdev^2)
+    k   <- max(1, which(cumsum(vr) >= var_exp)[1])
+    tr_scores <- as.data.frame(pca$x[, 1:k, drop = FALSE])
+    te_scores <- as.data.frame(as.matrix(x_te) %*% pca$rotation[, 1:k, drop = FALSE])
+    names(tr_scores) <- paste0(g, "_PC", seq_len(k))
+    names(te_scores) <- names(tr_scores)
+    train_out[[g]] <- tr_scores; test_out[[g]] <- te_scores; store[[g]] <- list(pca=pca,k=k)
+  }
+  list(Xtr = dplyr::bind_cols(train_out), Xte = dplyr::bind_cols(test_out), store = store)
 }
 
-features <- setdiff(names(df), drop_cols)
+gp  <- fit_group_pca(Xtr, Xte, groups, var_exp = 0.90)
+GXtr <- gp$Xtr
+GXte <- gp$Xte
 ```
 
 ```{r}
-# Risk Classification
-cls <- df %>% drop_na(risk_classification)
-idx_cls <- createDataPartition(cls$risk_classification, p = 0.8, list = FALSE)
-train_cls <- cls[idx_cls,]; test_cls <- cls[-idx_cls,]
+# Classification
+train_cls_noleak <- bind_cols(GXtr, risk_classification = train$risk_classification) %>%
+  dplyr::mutate(risk_classification = factor(make.names(risk_classification)))
 
-# Delivery Deviation
-reg <- df %>% drop_na(delivery_time_deviation)
-idx_reg <- createDataPartition(reg$delivery_time_deviation, p = 0.8, list = FALSE)
-train_reg <- reg[idx_reg,]; test_reg <- reg[-idx_reg,]
+test_cls_noleak  <- bind_cols(GXte, risk_classification = test$risk_classification) %>%
+  dplyr::mutate(risk_classification = factor(make.names(risk_classification),
+                                             levels = levels(train_cls_noleak$risk_classification)))
 
-# Delay Probability
-dly <- df %>% drop_na(delay_probability) %>%
-  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"), 
-                          levels = c("no","yes")))
-idx_dly <- createDataPartition(dly$delay_probability, p = 0.8, list = FALSE)
-train_dly <- dly[idx_dly,]; test_dly <- dly[-idx_dly,]
+# --- Regression Targets ---
+train_dis_noleak <- bind_cols(GXtr, y = train$disruption_likelihood_score)
+test_dis_noleak  <- bind_cols(GXte,  y = test$disruption_likelihood_score)
 
-# Disruption Likelihood
-disr <- df %>% drop_na(disruption_likelihood_score)
-idx_disr <- createDataPartition(disr$disruption_likelihood_score, p = 0.8, list = FALSE)
-train_disr <- disr[idx_disr,]; test_disr <- disr[-idx_disr,]
+train_dp_noleak  <- bind_cols(GXtr, y = train$delay_probability)
+test_dp_noleak   <- bind_cols(GXte,  y = test$delay_probability)
+
+train_dev_noleak <- bind_cols(GXtr, y = train$delivery_time_deviation)
+test_dev_noleak  <- bind_cols(GXte,  y = test$delivery_time_deviation)
 ```
 
 ```{r}
-# Risk Classification
-train_cls_noleak <- drop_leakage(train_cls, "risk_classification")
-test_cls_noleak  <- drop_leakage(test_cls,  "risk_classification")
+suppressWarnings({
+  if ("package:doParallel" %in% search()) foreach::registerDoSEQ()
+})
 
-# Multinomial Logistic
-model_multinom <- train(
-  risk_classification ~ .,
-  data = train_cls_noleak,
-  method = "multinom",
-  trControl = trainControl(method = "cv", number = 5, sampling = "smote"),
-  preProcess = c("center","scale"),
-  trace = FALSE
-)
-pred_multinom <- predict(model_multinom, test_cls_noleak)
-confusionMatrix(pred_multinom, test_cls$risk_classification)
-```
+ctrl_cv3 <- trainControl(method = "cv", number = 3, classProbs = TRUE, allowParallel = FALSE)
 
-```{r}
-# XGBoost
-grid <- expand.grid(
+xgb_grid <- expand.grid(
   nrounds = 100,
   max_depth = c(3, 5),
   eta = 0.1,
@@ -120,65 +166,38 @@ grid <- expand.grid(
   min_child_weight = 1,
   subsample = 0.8
 )
+```
 
-ctrl <- trainControl(
+```{r}
+# Risk Classification
+train_cls_noleak$risk_classification <- factor(make.names(train_cls_noleak$risk_classification))
+test_cls_noleak$risk_classification  <- factor(make.names(test_cls_noleak$risk_classification),
+                                               levels = levels(train_cls_noleak$risk_classification))
+
+ctrl_logit <- trainControl(
   method = "cv",
   number = 3,
-  sampling = "smote"
+  sampling = "smote",
+  classProbs = TRUE,
+  allowParallel = FALSE
 )
 
-model_xgb <- train(
-  risk_classification ~ .,
+set.seed(123)
+model_logit <- train(
+  risk_classification ~ ., 
   data = train_cls_noleak,
-  method = "xgbTree",
-  trControl = ctrl,
-  tuneGrid = grid
+  method = "multinom",
+  trControl = ctrl_logit,
+  trace = FALSE
 )
-pred_xgb <- predict(model_xgb, newdata = test_cls_noleak)
-pred_xgb <- factor(pred_xgb, levels = levels(test_cls$risk_classification))
-confusionMatrix(pred_xgb, test_cls$risk_classification)
+
+pred_logit <- predict(model_logit, newdata = test_cls_noleak)
+cm_logit <- confusionMatrix(pred_logit, test_cls_noleak$risk_classification)
+print(cm_logit)
 ```
 
 ```{r}
-vip(model_xgb$finalModel, num_features = 15) +
-  ggtitle("XGB: Risk Classification\nFeature Importance") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
-  geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradient(low = "lightgreen", high = "darkgreen") +
-  theme(legend.position = "none")
-```
-
-```{r}
-# Delivery Time Deviation
-train_reg_noleak <- drop_leakage(train_reg, "delivery_time_deviation")
-test_reg_noleak  <- drop_leakage(test_reg,  "delivery_time_deviation")
-
-# Linear Regression
-model_lm <- train(
-  delivery_time_deviation ~ .,
-  data = train_reg_noleak,
-  method = "lm",
-  trControl = trainControl(method = "cv", number = 5),
-  preProcess = c("center","scale")
-)
-pred_lm <- predict(model_lm, newdata = test_reg_noleak)
-met_lm  <- postResample(pred_lm, test_reg$delivery_time_deviation)
-```
-
-```{r}
-vip(model_lm$finalModel, num_features = 15) +
-  ggtitle("Linear Regression: Delivery Deviation\nFeature Importance") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
-  geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradientn(colors = c("yellow", "orange", "red", "purple", "blue")) +
-  theme(legend.position = "none")
-
-```
-
-```{r}
-# XGBoost Regression
+# XGBoost
 grid <- expand.grid(
   nrounds = 100,
   max_depth = c(3, 5),
@@ -189,123 +208,47 @@ grid <- expand.grid(
   subsample = 0.8
 )
 
-model_xgb_reg <- train(
-  delivery_time_deviation ~ .,
-  data = train_reg_noleak,
+ctrl_xgb <- trainControl(
+  method = "cv",
+  number = 3,
+  sampling = "smote",
+  classProbs = TRUE,
+  allowParallel = FALSE
+)
+
+set.seed(123)
+model_xgb <- train(
+  risk_classification ~ ., 
+  data = train_cls_noleak,
   method = "xgbTree",
-  trControl = trainControl(method = "cv", number = 3),
+  trControl = ctrl_xgb,
   tuneGrid = grid
 )
-pred_xgb_reg <- predict(model_xgb_reg, newdata = test_reg_noleak)
-met_xgb_reg  <- postResample(pred_xgb_reg, test_reg$delivery_time_deviation)
-print(met_xgb_reg)
+
+pred_xgb <- predict(model_xgb, newdata = test_cls_noleak)
+cm_xgb <- confusionMatrix(pred_xgb, test_cls_noleak$risk_classification)
+print(cm_xgb)
 ```
 
 ```{r}
-vip(model_lm$finalModel, num_features = 15) +
-  ggtitle("Linear Regression: Delivery Deviation\nFeature Importance") +
+imp <- xgb.importance(model = model_xgb$finalModel)
+
+ggplot(head(imp, 12), aes(x = reorder(Feature, Gain), y = Gain, fill = Gain)) +
+  geom_col() +
+  geom_text(aes(label = round(Gain, 3)), hjust = 1.1, color = "white", size = 3.5) + 
+  coord_flip() +
+  scale_fill_gradient(low = "lightgreen", high = "darkgreen") +
   theme_minimal(base_size = 14) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
-  geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradientn(colors = c("pink", "violet", "purple", "darkblue")) +
-  theme(legend.position = "none")
+  labs(
+    title = "XGBoost Feature Importance (Top 12 Predictors)",
+    x = "Feature",
+    y = "Importance (Gain)"
+  )
 ```
 
 ```{r}
-# Delay Probability
-
-# Data Prep
-train_dly_noleak <- drop_leakage(train_dly, "delay_probability")
-test_dly_noleak  <- drop_leakage(test_dly,  "delay_probability")
-
-train_dly_cls <- train_dly_noleak %>%
-  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes","no"), levels=c("no","yes")))
-test_dly_cls  <- test_dly_noleak %>%
-  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes","no"), levels=c("no","yes")))
-
-feat_cols <- setdiff(names(train_dly_cls), c("delayed","delay_probability")) 
-
-table(train_dly_cls$delayed)
-prop.table(table(train_dly_cls$delayed))
-```
-
-```{r}
-# Logistic Regression (baseline)
-ctrl <- trainControl(
-  method = "cv",
-  number = 5,
-  classProbs = TRUE,
-  summaryFunction = twoClassSummary,
-  sampling = "smote"
-)
-model_logit <- train(
-  x = train_dly_cls[, feat_cols] %>% as.data.frame(),
-  y = train_dly_cls$delayed,
-  method = "glm",
-  family = "binomial",
-  trControl = ctrl,
-  metric = "ROC"
-)
-
-pred_logit <- predict(model_logit, test_dly_cls[, feat_cols])
-confusionMatrix(pred_logit, test_dly_cls$delayed, positive = "yes")
-```
-
-```{r}
-vip(model_logit$finalModel, num_features = 15) +
-  ggtitle("Logistic Regression: Delay Probability\nFeature Importance") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
-  geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradient(low = "orange", high = "red") +
-  theme(legend.position = "none")
-```
-
-```{r}
-# Data Prep 2
-train_dly_cls <- train_dly %>%
-  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"),
-                          levels = c("no","yes")))
-test_dly_cls <- test_dly %>%
-  mutate(delayed = factor(if_else(delay_probability >= 0.5, "yes", "no"),
-                          levels = c("no","yes")))
-
-targets <- c("disruption_likelihood_score",
-             "delay_probability",
-             "risk_classification",
-             "delivery_time_deviation")
-
-feat_cols <- setdiff(colnames(train_dly_cls),
-                     c("delayed", targets, drop_cols))
-
-train_mat <- train_dly_cls[, feat_cols, drop = FALSE] %>%
-  dplyr::mutate(dplyr::across(where(is.logical), as.integer))
-test_mat  <- test_dly_cls[, feat_cols, drop = FALSE] %>%
-  dplyr::mutate(dplyr::across(where(is.logical), as.integer))
-
-dmy <- caret::dummyVars(~ ., data = train_mat, fullRank = TRUE)
-X_train <- as.data.frame(predict(dmy, newdata = train_mat))
-X_test  <- as.data.frame(predict(dmy, newdata = test_mat))
-
-nzv <- caret::nearZeroVar(X_train)
-if (length(nzv)) X_train <- X_train[, -nzv, drop = FALSE]
-X_test <- X_test[, colnames(X_train), drop = FALSE]
-
-train_xgb <- cbind(delayed = train_dly_cls$delayed, X_train)
-test_xgb  <- cbind(delayed = test_dly_cls$delayed,  X_test)
-```
-
-```{r}
-# XGBoost
-ctrl <- trainControl(
-  method = "cv", number = 3,
-  classProbs = TRUE,
-  summaryFunction = twoClassSummary,
-  sampling = "down"
-)
-
-grid <- expand.grid(
-  nrounds = 50,
+grid_reg <- expand.grid(
+  nrounds = 100,
   max_depth = c(3, 5),
   eta = 0.1,
   gamma = 0,
@@ -314,138 +257,155 @@ grid <- expand.grid(
   subsample = 0.8
 )
 
-model_xgb <- train(
-  delayed ~ .,
-  data = train_xgb,
-  method = "xgbTree",
-  trControl = ctrl,
-  tuneGrid = grid,
-  metric = "ROC",
+ctrl_reg <- trainControl(
+  method = "cv",
+  number = 3,
+  allowParallel = FALSE
 )
-
-pred_xgb <- predict(model_xgb, newdata = test_xgb)
-confusionMatrix(pred_xgb, test_xgb$delayed, positive = "yes")
-```
-
-```{r}
-vip(model_xgb$finalModel, num_features = 15) +
-  ggtitle("XGB: Delay Probability — Feature Importance") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
-  geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradientn(colors = c("orange", "magenta", "red")) +
-  theme(legend.position = "none")
 ```
 
 ```{r}
 # Disruption Likelihood Score
-train_disr_noleak <- drop_leakage(train_disr, "disruption_likelihood_score")
-test_disr_noleak  <- drop_leakage(test_disr,  "disruption_likelihood_score")
 
-# Linear Regression
-model_lm_disr <- train(
+# Linear Regression (baseline)
+train_idx <- createDataPartition(df_mod$disruption_likelihood_score, p = 0.7, list = FALSE)
+train_reg <- df_mod[train_idx, ]
+test_reg  <- df_mod[-train_idx, ]
+
+model_lm <- train(
   disruption_likelihood_score ~ .,
-  data = train_disr_noleak,
+  data = train_reg[, c(predictor_cols, "disruption_likelihood_score")],
   method = "lm",
-  trControl = trainControl(method = "cv", number = 5),
-  preProcess = c("center", "scale")
+  trControl = trainControl(method = "cv", number = 3)
 )
 
-pred_lm_disr <- predict(model_lm_disr, newdata = test_disr_noleak)
-met_lm_disr  <- postResample(pred_lm_disr, test_disr$disruption_likelihood_score)
-print(met_lm_disr)
-```
-
-```{r}
-vip(model_lm_disr$finalModel, num_features = 15) +
-  ggtitle("Linear Regression: Disruption Likelihood\nFeature Importance") +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
-  geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradient(low = "lightgreen", high = "darkgreen") +
-  theme(legend.position = "none")
+pred_lm <- predict(model_lm, newdata = test_reg)
+postResample(pred_lm, test_reg$disruption_likelihood_score)
 ```
 
 ```{r}
 # XGBoost
-grid_disr <- expand.grid(
-  nrounds = 100,
-  max_depth = c(3, 5),
-  eta = 0.1,
-  gamma = 0,
-  colsample_bytree = 0.8,
-  min_child_weight = 1,
-  subsample = 0.8
-)
+train_dis_grp <- bind_cols(GXtr, y = train$disruption_likelihood_score)
+test_dis_grp  <- bind_cols(GXte,  y = test$disruption_likelihood_score)
 
-model_xgb_disr <- train(
-  disruption_likelihood_score ~ .,
-  data = train_disr_noleak,
+model_xgb_reg <- train(
+  y ~ ., data = train_dis_grp,
   method = "xgbTree",
-  trControl = trainControl(method = "cv", number = 3),
-  tuneGrid = grid_disr
+  trControl = ctrl_reg,
+  tuneGrid = grid_reg
 )
 
-pred_xgb_disr <- predict(model_xgb_disr, newdata = test_disr_noleak)
-met_xgb_disr  <- postResample(pred_xgb_disr, test_disr$disruption_likelihood_score)
-print(met_xgb_disr)
+pred_xgb_reg <- predict(model_xgb_reg, newdata = test_dis_grp)
+postResample(pred_xgb_reg, test_dis_grp$y)
 ```
 
 ```{r}
-vip(model_xgb_disr$finalModel, num_features = 15) +
-  ggtitle("XGB: Disruption Likelihood\nFeature Importance") +
+imp_reg <- xgb.importance(model = model_xgb_reg$finalModel)
+
+ggplot(head(imp_reg, 12), aes(x = reorder(Feature, Gain), y = Gain, fill = Gain)) +
+  geom_col() +
+  geom_text(aes(label = round(Gain, 3)), hjust = 1.1, color = "white", size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(low = "gold", high = "brown") +
   theme_minimal(base_size = 14) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold", size = 16, lineheight = 1.1)) +
-  geom_bar(stat = "identity", aes(fill = Importance)) +
-  scale_fill_gradientn(colors = c("gold", "orange", "brown")) +
-  theme(legend.position = "none")
-```
-
-
-## Model Selection
-
-```{r}
-# Build formula for full model (exclude leakage cols and other targets)
-form_cls <- as.formula(
-  paste("risk_classification ~",
-        paste(setdiff(names(train_cls_noleak), "risk_classification"),
-              collapse = "+"))
-)
-
-# Full multinomial model
-full_model_cls <- multinom(form_cls, data = train_cls_noleak, trace = FALSE)
-
-# Null model (intercept only)
-null_model_cls <- multinom(risk_classification ~ 1, data = train_cls_noleak, trace = FALSE)
-
-# ---- Stepwise with AIC (both directions) ----
-step_aic_cls <- stepAIC(
-  null_model_cls,
-  scope = list(lower = null_model_cls, upper = full_model_cls),
-  direction = "both",
-  trace = TRUE
-)
-summary(step_aic_cls)
-
-# ---- Stepwise with BIC (both directions) ----
-n_cls <- nrow(train_cls_noleak)
-step_bic_cls <- stepAIC(
-  null_model_cls,
-  scope = list(lower = null_model_cls, upper = full_model_cls),
-  direction = "both",
-  k = log(n_cls),   # BIC penalty
-  trace = TRUE
-)
-summary(step_bic_cls)
+  labs(title = "XGBoost Group Importance – Disruption Likelihood",
+       x = "Group Feature", y = "Importance (Gain)")
 ```
 
 ```{r}
-pred_aic <- predict(step_aic_cls, newdata = test_cls_noleak)
-confusionMatrix(pred_aic, test_cls$risk_classification)
+# Delay Probability
+
+# Linear Regression (baseline)
+train_idx <- createDataPartition(df_mod$delay_probability, p = 0.7, list = FALSE)
+train_dp <- df_mod[train_idx, ]
+test_dp  <- df_mod[-train_idx, ]
+
+model_lm_dp <- train(
+  delay_probability ~ .,
+  data = train_dp[, c(predictor_cols, "delay_probability")],
+  method = "lm",
+  trControl = trainControl(method = "cv", number = 3)
+)
+
+pred_lm_dp <- predict(model_lm_dp, newdata = test_dp)
+postResample(pred_lm_dp, test_dp$delay_probability)
 ```
 
 ```{r}
-pred_bic <- predict(step_bic_cls, newdata = test_cls_noleak)
-confusionMatrix(pred_bic, test_cls$risk_classification)
+# XGBoost
+train_dp_grp <- bind_cols(GXtr, y = train$delay_probability)
+test_dp_grp  <- bind_cols(GXte,  y = test$delay_probability)
+
+model_xgb_dp <- train(
+  y ~ ., data = train_dp_grp,
+  method = "xgbTree",
+  trControl = ctrl_reg,
+  tuneGrid = grid_reg
+)
+
+pred_xgb_dp <- predict(model_xgb_dp, newdata = test_dp_grp)
+postResample(pred_xgb_dp, test_dp_grp$y)
 ```
+
+```{r}
+imp_dp <- xgb.importance(model = model_xgb_dp$finalModel)
+
+ggplot(head(imp_dp, 12), aes(x = reorder(Feature, Gain), y = Gain, fill = Gain)) +
+  geom_col() +
+  geom_text(aes(label = round(Gain, 3)), hjust = 1.1, color = "white", size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(low = "skyblue", high = "navy") +
+  theme_minimal(base_size = 14) +
+  labs(title = "XGBoost Group Importance – Delay Probability",
+       x = "Group Feature", y = "Importance (Gain)")
+```
+
+```{r}
+# Delivery Time Deviation
+
+# Linear Regression (baseline)
+train_idx <- createDataPartition(df_mod$delivery_time_deviation, p = 0.7, list = FALSE)
+train_dev <- df_mod[train_idx, ]
+test_dev  <- df_mod[-train_idx, ]
+
+model_lm_dev <- train(
+  delivery_time_deviation ~ .,
+  data = train_dev[, c(predictor_cols, "delivery_time_deviation")],
+  method = "lm",
+  trControl = trainControl(method = "cv", number = 3)
+)
+
+pred_lm_dev <- predict(model_lm_dev, newdata = test_dev)
+postResample(pred_lm_dev, test_dev$delivery_time_deviation)
+```
+
+```{r}
+# XGBoost
+train_dev_grp <- bind_cols(GXtr, y = train$delivery_time_deviation)
+test_dev_grp  <- bind_cols(GXte,  y = test$delivery_time_deviation)
+
+model_xgb_dev <- train(
+  y ~ ., data = train_dev_grp,
+  method = "xgbTree",
+  trControl = ctrl_reg,
+  tuneGrid = grid_reg
+)
+
+pred_xgb_dev <- predict(model_xgb_dev, newdata = test_dev_grp)
+postResample(pred_xgb_dev, test_dev_grp$y)
+```
+
+```{r}
+imp_dev <- xgb.importance(model = model_xgb_dev$finalModel)
+
+ggplot(head(imp_dev, 12), aes(x = reorder(Feature, Gain), y = Gain, fill = Gain)) +
+  geom_col() +
+  geom_text(aes(label = round(Gain, 3)), hjust = 1.1, color = "white", size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(low = "lightcoral", high = "darkred") +
+  theme_minimal(base_size = 14) +
+  labs(title = "XGBoost Group Importance – Delivery Time Deviation",
+       x = "Group Feature", y = "Importance (Gain)")
+```
+
 
